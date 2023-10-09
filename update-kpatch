@@ -1,0 +1,119 @@
+#!/bin/bash
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+KERN_SRC=""
+PATCH=""
+
+usage()
+{
+	echo "Usage: update-kpatch -p {CVE}.patch {opts}
+-k [/path/to/kernel/src]
+-r [/path/to/kernel/rpm]"
+}
+
+update_patch()
+{
+	local dir
+	local old
+	local new
+	local kern
+	local commits
+
+	dir="$1"
+	old="$2"
+	kern=$(echo "$3" | sed 's:/*$::')
+
+	if [[ ! "$old" =~ \.patch$ ]] || [[ ! -f "$old" ]]; then
+		>&2 echo -e "${RED}ERROR: Not a patch file, look for [path/to/file.patch]${NC}"
+		exit 1
+	fi
+
+	if [[ ! "$kern" =~ kernel ]]; then
+		echo -e -n "${YELLOW}"
+		read -p $"WARNING: Are you sure [ $kern/ ] is a kernel source? [Y/n]: " resp
+		echo -e -n "${NC}"
+		if [[ "$resp" =~ [nN] ]]; then
+			exit 1
+		fi
+	fi
+
+	commits=$(git -C "$kern" log "remotes/${Z_REMOTE}/${Z_BRANCH}" \
+              --reverse --no-merges --format="%h" \
+              --grep "^CVE: $CVE" --grep "^Bugzilla: .*$Z_BZ")
+	new="$(pwd)/$(basename $old).updated"
+
+	echo -e "${GREEN}Creating backup copy of kernel sources${NC}"
+	rm -rf "${kern}.orig"
+	cp -r "$kern" "${kern}.orig"
+
+	if ! patch -d "$kern" --dry-run --quiet -p1 < "$old"; then
+		>&2 echo -e "${RED}ERROR: Cannot update patch --- manual update required${NC}"
+		rm -rf "${kern}.orig"
+		exit 1
+	fi
+
+	echo -e "${GREEN}Patching original source${NC}"
+	patch -d "$kern" -p1 --no-backup-if-mismatch < "$old"
+
+	local modifications=$(awk -vRS= -vORS='\n\n' '/Modifications:/' "$old")
+	echo -e "${GREEN}Generating new patch${NC}"
+	(echo -e "kpatch fixes for $CVE\n\n$modifications"; git -C "$kern" show -s $commits) > "$new"
+	diff -Nupr "${kern}.orig" "$kern" >> "$new" || true
+	sed -i "s#$kernel#src#g#" "$new"
+
+	echo "Deleting copy of kernel tree"
+	rm -rf "$kern"
+
+	echo "Restoring original copy of kernel tree"
+	mv "${kern}.orig" "$kern"
+	
+	echo -e "${YELLOW}WARNING: This is an attempt to update your original patch to work with the new kernel: $kern
+Please be sure to review the commits for the current CVE workflow to be certain, as sometimes
+fixes and their structures change between RHEL versions${NC}"
+}
+
+extract_rpm()
+{
+	local rpm_src
+	local kern_name
+	local linux_name
+	local arch
+
+	rpm_src="$1"
+	kern_name="${rpm_src%.src.rpm}"
+	linux_name="linux${kern_name#kernel}.$(uname -m)"
+	
+	rpm -ivh "$rpm_src"
+	rpmbuild --nodeps -bp "$HOME/rpmbuild/SPECS/kernel.spec"
+	KERN_SRC="$HOME/rpmbuild/BUILD/$kern_name/$linux_name/"
+}
+
+while getopts "hk:r:p:" opt; do
+	case "$opt" in
+		h)
+			usage
+			exit 0
+			;;
+		p)
+			PATCH=$OPTARG
+			;;
+		k)
+			KERN_SRC=$OPTARG
+			;;
+		r)
+			extract_rpm $OPTARG
+			;;
+	esac
+done
+
+CVE="$(basename $PATCH .patch)"
+source "$(pwd)/${CVE}.env"
+
+if [ -z "$PATCH" ] || [ -z "$KERN_SRC" ]; then
+	usage
+	exit 1
+fi
+
+update_patch "$(pwd)" "$PATCH" "$KERN_SRC"
